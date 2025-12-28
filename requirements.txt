@@ -1,0 +1,7 @@
+numpy
+scipy
+scikit-image
+svgwrite
+Pillow
+torch
+cairosvg  # Optional: for SVG preview rendering

@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-happnodeset"
+description = ""
+version = "0.1.1"
+license = {file = "LICENSE"}
+dependencies = ["numpy", "scipy", "scikit-image", "svgwrite", "Pillow", "torch", "cairosvg"]
+
+[project.urls]
+Repository = "https://github.com/mikemojen/ComfyUI-HappNodeSet"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "mikemojen"
+DisplayName = "ComfyUI-HappNodeSet"
+Icon = "https://mojen.ai/logo/corgi-logo-dark.svg"
