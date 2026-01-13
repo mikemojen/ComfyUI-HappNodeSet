@@ -9,6 +9,7 @@ from .colorquantize import *
 from .blackextract import *
 from .autocrop import *
 from .numfunction import *
+from .linecounter import *
 
 NODE_CLASS_MAPPINGS = {
     "RasterToUniformSVG": RasterToSVGConverter,
@@ -17,10 +18,15 @@ NODE_CLASS_MAPPINGS = {
     "SVGPathLengthDetailed" : SVGPathLengthDetailed,
     "ColorQuantizer" : ImageColorQuantizer,
     "ExtractBlack": ExtractBlackColor,
+    "ExtractRed" : ExtractRedColor,
     "ExtractBlackAdvanced" : ExtractBlackColorAdvanced,
+    "NonWhiteToBlack": NonWhiteToBlack,
+    "DashedToSolidLine": DashedToSolidLine,
+    "LineDetector": LineDetectorNode,
     "AutoCrop": AutoCropNode,
     "RoundUpNode": RoundUpNode,
-    "RoundDownNode": RoundDownNode
+    "RoundDownNode": RoundDownNode,
+    "CSVValueExtractor": CSVValueExtractor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -30,8 +36,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SVGPathLengthDetailed" : "SVG Detailed PathLength",
     "ColorQuantizer" : "Color Quantizer",
     "ExtractBlack": "Extract Black",
+    "ExtractRed" : "Extract Red",
     "ExtractBlackAdvanced" : "Extract Black Advanced",
+    "NonWhiteToBlack": "Non-White to Black",
+    "DashedToSolidLine": "Dashed to Solid Line",
+    "LineDetector": "Line Detector",
     "AutoCrop": "Auto Crop",
     "RoundUpNode": "Round Up",
-    "RoundDownNode": "Round Down"
+    "RoundDownNode": "Round Down",
+    "CSVValueExtractor": "CSV Value Extractor",
 }
