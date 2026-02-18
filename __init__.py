@@ -10,6 +10,7 @@ from .blackextract import *
 from .autocrop import *
 from .numfunction import *
 from .linecounter import *
+from .numstrcleanup import *
 
 NODE_CLASS_MAPPINGS = {
     "RasterToUniformSVG": RasterToSVGConverter,
@@ -27,6 +28,7 @@ NODE_CLASS_MAPPINGS = {
     "RoundUpNode": RoundUpNode,
     "RoundDownNode": RoundDownNode,
     "CSVValueExtractor": CSVValueExtractor,
+    "NumberStringCleanup": NumberStringCleanup,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -45,4 +47,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RoundUpNode": "Round Up",
     "RoundDownNode": "Round Down",
     "CSVValueExtractor": "CSV Value Extractor",
+    "NumberStringCleanup": "Number String Cleanup",
 }
