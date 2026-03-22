@@ -11,6 +11,7 @@ from .autocrop import *
 from .numfunction import *
 from .linecounter import *
 from .numstrcleanup import *
+from .laserpath import *
 
 NODE_CLASS_MAPPINGS = {
     "RasterToUniformSVG": RasterToSVGConverter,
@@ -29,6 +30,7 @@ NODE_CLASS_MAPPINGS = {
     "RoundDownNode": RoundDownNode,
     "CSVValueExtractor": CSVValueExtractor,
     "NumberStringCleanup": NumberStringCleanup,
+    "LaserPathTracer": LaserPathTracerNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -48,4 +50,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RoundDownNode": "Round Down",
     "CSVValueExtractor": "CSV Value Extractor",
     "NumberStringCleanup": "Number String Cleanup",
+    "LaserPathTracer": "Laser Cutter Path Tracer",
 }
