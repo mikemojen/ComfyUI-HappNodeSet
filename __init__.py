@@ -12,6 +12,7 @@ from .numfunction import *
 from .linecounter import *
 from .numstrcleanup import *
 from .laserpath import *
+from .contourgapcloser import *
 
 NODE_CLASS_MAPPINGS = {
     "RasterToUniformSVG": RasterToSVGConverter,
@@ -31,6 +32,9 @@ NODE_CLASS_MAPPINGS = {
     "CSVValueExtractor": CSVValueExtractor,
     "NumberStringCleanup": NumberStringCleanup,
     "LaserPathTracer": LaserPathTracerNode,
+    "HoleCounter": HoleCounterNode,
+    "ContourGapCloser": ContourGapCloser,
+    "ContourEndpointVisualizer": ContourEndpointVisualizer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -51,4 +55,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CSVValueExtractor": "CSV Value Extractor",
     "NumberStringCleanup": "Number String Cleanup",
     "LaserPathTracer": "Laser Cutter Path Tracer",
+    "HoleCounter": "Hole Counter (Robust)",
+    "ContourGapCloser": "Contour Gap Closer",
+    "ContourEndpointVisualizer": "Contour Endpoint Visualizer",
 }
