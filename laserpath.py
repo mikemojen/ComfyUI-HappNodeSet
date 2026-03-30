@@ -1,395 +1,855 @@
 """
-ComfyUI Custom Node: Laser Cutter Path Tracer
-Detects internal contours (holes) in a B&W diagram and traces the optimal
-laser cutter head path between them using nearest-neighbor + 2-opt TSP.
+ComfyUI Custom Nodes: Laser Cutter Path Tracer & Hole Counter
+==============================================================
+Detects ALL internal contours (holes, slots, cutouts, notches, complex
+shapes) in a B&W laser-cutting diagram and traces the optimal laser
+cutter head path between them.
 """
- 
+
+import math
 import numpy as np
 import cv2
+
 try:
     import torch
 except ImportError:
     torch = None
-from itertools import combinations
- 
- 
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Geometry helpers
 # ──────────────────────────────────────────────────────────────────────
- 
+
 def contour_centroid(contour):
     """Return (cx, cy) of a contour using image moments."""
     M = cv2.moments(contour)
     if M["m00"] == 0:
-        # fallback: mean of all points
         pts = contour.reshape(-1, 2)
         return float(pts[:, 0].mean()), float(pts[:, 1].mean())
     return float(M["m10"] / M["m00"]), float(M["m01"] / M["m00"])
- 
- 
+
+
 def contour_nearest_edge_point(contour, ref_point):
     """Return the point on `contour` closest to `ref_point`."""
     pts = contour.reshape(-1, 2).astype(np.float64)
     ref = np.array(ref_point, dtype=np.float64)
     dists = np.linalg.norm(pts - ref, axis=1)
     return tuple(pts[np.argmin(dists)].astype(int))
- 
- 
+
+
 def euclidean(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
- 
- 
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Contour shape classification
+# ──────────────────────────────────────────────────────────────────────
+
+def classify_contour(contour):
+    """
+    Classify a contour by its geometric properties.
+    Returns dict with: type, circularity, aspect_ratio, solidity,
+    vertex_count, bbox, area, perimeter.
+    """
+    area = cv2.contourArea(contour)
+    perimeter = cv2.arcLength(contour, True)
+    bbox = cv2.boundingRect(contour)
+
+    if perimeter < 1 or area < 1:
+        return dict(type="line", circularity=0, aspect_ratio=1,
+                    solidity=0, vertex_count=len(contour),
+                    bbox=bbox, area=area, perimeter=perimeter)
+
+    circularity = 4 * math.pi * area / (perimeter ** 2)
+
+    rect = cv2.minAreaRect(contour)
+    rw, rh = rect[1]
+    aspect_ratio = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else 1.0
+
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = area / hull_area if hull_area > 0 else 0
+
+    epsilon = 0.02 * perimeter
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    vertex_count = len(approx)
+
+    # Classification
+    if circularity > 0.75:
+        shape_type = "hole"
+    elif circularity > 0.55 and aspect_ratio < 1.6:
+        shape_type = "hole"
+    elif aspect_ratio > 2.5:
+        shape_type = "slot"
+    elif vertex_count == 3:
+        shape_type = "triangle"
+    elif vertex_count == 4 and solidity > 0.85:
+        shape_type = "rectangle"
+    elif vertex_count <= 8 and solidity > 0.80:
+        shape_type = "polygon"
+    elif solidity < 0.60:
+        shape_type = "complex"
+    else:
+        shape_type = "cutout"
+
+    return dict(type=shape_type, circularity=circularity,
+                aspect_ratio=aspect_ratio, solidity=solidity,
+                vertex_count=vertex_count, bbox=bbox,
+                area=area, perimeter=perimeter)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Internal feature data structure
+# ──────────────────────────────────────────────────────────────────────
+
+class InternalFeature:
+    """Represents a single detected internal feature."""
+    __slots__ = ("center", "contour", "classification", "bbox", "area")
+
+    def __init__(self, center, contour, classification):
+        self.center = center
+        self.contour = contour
+        self.classification = classification
+        self.bbox = classification["bbox"]
+        self.area = classification["area"]
+
+    @property
+    def type(self):
+        return self.classification["type"]
+
+    def info_str(self):
+        c = self.classification
+        return (
+            f"({self.center[0]:.0f}, {self.center[1]:.0f}) "
+            f"type={self.type}, area={c['area']:.0f}, "
+            f"circ={c['circularity']:.2f}, AR={c['aspect_ratio']:.1f}, "
+            f"solid={c['solidity']:.2f}, verts={c['vertex_count']}"
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  TSP solvers
 # ──────────────────────────────────────────────────────────────────────
- 
+
 def nearest_neighbor_open(points, start_idx, end_idx):
-    """
-    Greedy nearest-neighbor for an open path.
-    Starts at `start_idx`, must finish at `end_idx`.
-    Returns ordered list of indices.
-    """
     n = len(points)
     if n <= 2:
         return list(range(n))
- 
     visited = [False] * n
     path = [start_idx]
     visited[start_idx] = True
-    # Reserve end point
     visited[end_idx] = True
- 
     current = start_idx
-    remaining = n - 2  # exclude start and end
- 
-    for _ in range(remaining):
-        best_dist = float("inf")
-        best_idx = -1
+    for _ in range(n - 2):
+        best_dist, best_idx = float("inf"), -1
         for j in range(n):
             if not visited[j]:
                 d = euclidean(points[current], points[j])
                 if d < best_dist:
-                    best_dist = d
-                    best_idx = j
+                    best_dist, best_idx = d, j
         if best_idx == -1:
             break
         visited[best_idx] = True
         path.append(best_idx)
         current = best_idx
- 
     path.append(end_idx)
     return path
- 
- 
+
+
 def two_opt_improve(path, points, max_iterations=1000):
-    """
-    2-opt local search improvement for an open path.
-    Keeps first and last elements fixed.
-    """
     def path_length(p):
-        return sum(euclidean(points[p[i]], points[p[i + 1]]) for i in range(len(p) - 1))
- 
+        return sum(euclidean(points[p[i]], points[p[i+1]]) for i in range(len(p)-1))
     best_dist = path_length(path)
     improved = True
     iteration = 0
- 
     while improved and iteration < max_iterations:
         improved = False
         iteration += 1
-        # Only reverse interior segments (keep index 0 and -1 fixed)
         for i in range(1, len(path) - 2):
             for j in range(i + 1, len(path) - 1):
-                new_path = path[:i] + path[i : j + 1][::-1] + path[j + 1 :]
+                new_path = path[:i] + path[i:j+1][::-1] + path[j+1:]
                 new_dist = path_length(new_path)
                 if new_dist < best_dist - 1e-6:
-                    path = new_path
-                    best_dist = new_dist
-                    improved = True
+                    path, best_dist, improved = new_path, new_dist, True
                     break
             if improved:
                 break
- 
     return path
- 
- 
+
+
 def solve_tsp(points, start_idx, end_idx):
-    """Solve open-path TSP with fixed start and end using NN + 2-opt."""
     if len(points) <= 1:
         return list(range(len(points)))
     if len(points) == 2:
         return [start_idx, end_idx]
- 
     path = nearest_neighbor_open(points, start_idx, end_idx)
     path = two_opt_improve(path, points)
     return path
- 
- 
+
+
 # ──────────────────────────────────────────────────────────────────────
-#  Contour classification
+#  Binarization helper
 # ──────────────────────────────────────────────────────────────────────
- 
+
+def _binarize(gray_img, binary_threshold, invert_image,
+              use_adaptive_threshold, adaptive_block_size, adaptive_c):
+    """Return binary image (white bg, black lines)."""
+    if use_adaptive_threshold:
+        block = adaptive_block_size | 1  # ensure odd
+        binary = cv2.adaptiveThreshold(
+            gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, block, adaptive_c)
+    else:
+        _, binary = cv2.threshold(gray_img, binary_threshold, 255,
+                                  cv2.THRESH_BINARY)
+    if invert_image:
+        binary = cv2.bitwise_not(binary)
+    return binary
+
+
+def _find_external_boundary(contours, areas):
+    if not contours:
+        return -1, None, 0
+    ext_idx = int(np.argmax(areas))
+    return ext_idx, contours[ext_idx], areas[ext_idx]
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Legacy: simple contour detection (used by HoleCounter pass 3)
+# ──────────────────────────────────────────────────────────────────────
+
 def find_internal_contours(binary_img, min_area=30, max_area_ratio=0.5):
-    """
-    Detect internal contours (holes) inside the external boundary.
- 
-    Strategy:
-      1. Find all contours with full hierarchy.
-      2. Identify the external contour as the largest by area.
-      3. Internal contours are contours whose centroid lies inside
-         the external contour and whose area is much smaller.
- 
-    Returns: (external_contour, list_of_internal_contours)
-    """
     contours, hierarchy = cv2.findContours(
-        binary_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
- 
+        binary_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None, []
- 
-    # Sort by area descending
     areas = [cv2.contourArea(c) for c in contours]
-    max_area = max(areas) if areas else 0
- 
-    if max_area == 0:
+    if max(areas) == 0:
         return None, []
- 
-    # External contour = largest
     ext_idx = int(np.argmax(areas))
     external_contour = contours[ext_idx]
     ext_area = areas[ext_idx]
- 
-    # Internal contours: smaller contours whose centroid is inside the external
+
     candidates = []
     for i, c in enumerate(contours):
         if i == ext_idx:
             continue
         a = areas[i]
-        if a < min_area:
+        if a < min_area or a > ext_area * max_area_ratio:
             continue
-        if a > ext_area * max_area_ratio:
-            continue
- 
         cx, cy = contour_centroid(c)
-        # Check if centroid is inside external contour
-        inside = cv2.pointPolygonTest(external_contour, (cx, cy), False)
-        if inside >= 0:
+        if cv2.pointPolygonTest(external_contour, (cx, cy), False) >= 0:
             candidates.append((c, cx, cy, a))
- 
-    # Deduplicate: drawn circle strokes produce two contours (inner/outer)
-    # with nearly identical centroids. Keep the larger one per cluster.
-    dedup_radius = 15  # px — merge contours with centroids this close
-    candidates.sort(key=lambda x: -x[3])  # sort by area descending
-    internal = []
-    used_centroids = []
+
+    candidates.sort(key=lambda x: -x[3])
+    internal, used = [], []
     for c, cx, cy, a in candidates:
-        duplicate = False
-        for ux, uy in used_centroids:
-            if ((cx - ux) ** 2 + (cy - uy) ** 2) ** 0.5 < dedup_radius:
-                duplicate = True
-                break
-        if not duplicate:
+        if not any(((cx-ux)**2+(cy-uy)**2)**0.5 < 15 for ux, uy in used):
             internal.append(c)
-            used_centroids.append((cx, cy))
- 
+            used.append((cx, cy))
     return external_contour, internal
- 
- 
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Pass 1: Contour-based detection (finds ANY drawn shape)
+# ──────────────────────────────────────────────────────────────────────
+
+def _contour_based_detect(binary, min_area, max_area_ratio):
+    """
+    Hierarchy-aware contour detection that finds ALL internal features:
+    holes, slots, rectangles, stars, polygons, etc.
+    """
+    lines_mask = cv2.bitwise_not(binary)
+    contours, hierarchy = cv2.findContours(
+        lines_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours or hierarchy is None:
+        return [], None
+
+    areas = [cv2.contourArea(c) for c in contours]
+    ext_idx, ext_contour, ext_area = _find_external_boundary(contours, areas)
+    if ext_contour is None:
+        return [], None
+
+    features = []
+    for i, c in enumerate(contours):
+        if i == ext_idx:
+            continue
+        a = areas[i]
+        if a < min_area or a > ext_area * max_area_ratio:
+            continue
+        cx, cy = contour_centroid(c)
+        if cv2.pointPolygonTest(ext_contour, (cx, cy), False) < 0:
+            continue
+
+        # Reject boundary artifacts: if most contour points are very
+        # close to the external boundary AND the shape is not a
+        # recognizable feature (hole, slot, etc.), reject it.
+        # Key insight: legitimate edge-mounted holes have high
+        # circularity. Boundary artifacts (corner fragments,
+        # double-stroke edges) have low circularity and high
+        # aspect ratio.
+        cls = classify_contour(c)
+
+        pts = c.reshape(-1, 2).astype(np.float64)
+        if len(pts) > 0:
+            dists = [abs(cv2.pointPolygonTest(ext_contour, (float(p[0]), float(p[1])), True))
+                     for p in pts[::max(1, len(pts)//20)]]
+            median_dist = float(np.median(dists))
+            if median_dist < 15:
+                # Near boundary — only keep if it looks like a real feature
+                circ = cls["circularity"]
+                solid = cls["solidity"]
+                ar = cls["aspect_ratio"]
+                # Reject: low circularity OR elongated = boundary artifact
+                # Keep: high circularity (>0.65) = legitimate hole/feature
+                if circ < 0.65:
+                    continue
+                if solid > 0.95 and a > ext_area * 0.01:
+                    continue  # large solid region hugging boundary
+
+        features.append(InternalFeature((cx, cy), c, cls))
+
+    return features, ext_contour
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Pass 2/3: Flood-fill detection (finds enclosed white pockets)
+# ──────────────────────────────────────────────────────────────────────
+
+def _flood_fill_detect_features(binary, min_area, max_area_ratio,
+                                morph_close_size=0, morph_dilate_size=0):
+    h, w = binary.shape[:2]
+    lines_mask = cv2.bitwise_not(binary)
+
+    if morph_close_size > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (morph_close_size, morph_close_size))
+        lines_mask = cv2.morphologyEx(lines_mask, cv2.MORPH_CLOSE, k)
+    if morph_dilate_size > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (morph_dilate_size, morph_dilate_size))
+        lines_mask = cv2.dilate(lines_mask, k, iterations=1)
+
+    repaired = cv2.bitwise_not(lines_mask)
+    contours_all, _ = cv2.findContours(
+        lines_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours_all:
+        return []
+    areas_all = [cv2.contourArea(c) for c in contours_all]
+    _, ext_contour, ext_area = _find_external_boundary(contours_all, areas_all)
+    if ext_contour is None:
+        return []
+
+    flood = repaired.copy()
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 0)
+
+    num_labels, labels, stats, centroids_cc = cv2.connectedComponentsWithStats(
+        flood, connectivity=8)
+
+    max_feat_area = ext_area * max_area_ratio
+    features = []
+    for lid in range(1, num_labels):
+        area = stats[lid, cv2.CC_STAT_AREA]
+        if area < min_area or area > max_feat_area:
+            continue
+        cx, cy = float(centroids_cc[lid][0]), float(centroids_cc[lid][1])
+        if cv2.pointPolygonTest(ext_contour, (cx, cy), False) < 0:
+            continue
+        # Boundary proximity check — shape-aware
+        dist_to_boundary = abs(cv2.pointPolygonTest(
+            ext_contour, (cx, cy), True))
+        cmask = (labels == lid).astype(np.uint8) * 255
+        cc, _ = cv2.findContours(cmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cont = cc[0] if cc else None
+        cls = classify_contour(cont) if cont is not None else dict(
+            type="hole", circularity=0, aspect_ratio=1, solidity=0,
+            vertex_count=0, bbox=(int(cx), int(cy), 1, 1),
+            area=area, perimeter=0)
+
+        if dist_to_boundary < 20:
+            circ = cls["circularity"]
+            # Keep circular features near boundary, reject artifacts
+            if circ < 0.65:
+                continue
+            if cls["solidity"] > 0.95 and area > ext_area * 0.01:
+                continue
+
+        features.append(InternalFeature((cx, cy), cont, cls))
+    return features
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Pass 4: Open contour detection (arcs, grooves, engravings)
+# ──────────────────────────────────────────────────────────────────────
+
+def _open_contour_detect(binary, ext_contour, ext_area,
+                         min_area, max_area_ratio):
+    """
+    Detect open contours — arcs, grooves, engravings — that are line
+    segments inside the boundary but don't form closed regions.
+    Uses connected-component analysis on the black line pixels.
+    """
+    lines_mask = cv2.bitwise_not(binary)
+    num_labels, labels, stats, centroids_cc = cv2.connectedComponentsWithStats(
+        lines_mask, connectivity=8)
+
+    if num_labels < 2:
+        return []
+
+    # The largest line-pixel component is always the external boundary
+    # itself (or boundary + connected inner lines). Skip it.
+    all_areas = [stats[lid, cv2.CC_STAT_AREA] for lid in range(1, num_labels)]
+    max_line_comp_label = int(np.argmax(all_areas)) + 1  # +1 to skip bg
+
+    max_feat_area = ext_area * max_area_ratio
+    features = []
+    for lid in range(1, num_labels):
+        if lid == max_line_comp_label:
+            continue  # skip external boundary
+        area = stats[lid, cv2.CC_STAT_AREA]
+        if area < min_area or area > max_feat_area:
+            continue
+        cx, cy = float(centroids_cc[lid][0]), float(centroids_cc[lid][1])
+        if ext_contour is not None:
+            if cv2.pointPolygonTest(ext_contour, (cx, cy), False) < 0:
+                continue
+            # Boundary proximity — shape-aware
+            dist_to_boundary = abs(cv2.pointPolygonTest(
+                ext_contour, (cx, cy), True))
+            if dist_to_boundary < 20:
+                # Classify first to decide
+                cmask_pre = (labels == lid).astype(np.uint8) * 255
+                cc_pre, _ = cv2.findContours(cmask_pre, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cont_pre = cc_pre[0] if cc_pre else None
+                if cont_pre is not None:
+                    cls_pre = classify_contour(cont_pre)
+                    if cls_pre["circularity"] < 0.65:
+                        continue
+                    if cls_pre["solidity"] > 0.95 and area > ext_area * 0.01:
+                        continue
+                else:
+                    continue
+        cmask = (labels == lid).astype(np.uint8) * 255
+        cc, _ = cv2.findContours(cmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cont = cc[0] if cc else None
+        if cont is not None:
+            cls = classify_contour(cont)
+            peri = cv2.arcLength(cont, True)
+            if peri > 0 and area / peri < 2.0:
+                cls["type"] = "arc"
+        else:
+            cls = dict(type="arc", circularity=0, aspect_ratio=1,
+                       solidity=0, vertex_count=0,
+                       bbox=(int(cx), int(cy), 1, 1),
+                       area=area, perimeter=0)
+        features.append(InternalFeature((cx, cy), cont, cls))
+    return features
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Deduplication
+# ──────────────────────────────────────────────────────────────────────
+
+def _deduplicate_features(features, dedup_radius):
+    if dedup_radius <= 0 or not features:
+        return features
+    features.sort(key=lambda f: -f.area)
+    deduped, used = [], []
+    for f in features:
+        cx, cy = f.center
+        if not any(((cx-ux)**2+(cy-uy)**2)**0.5 < dedup_radius
+                   for ux, uy in used):
+            deduped.append(f)
+            used.append((cx, cy))
+    return deduped
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Master detection: robust_find_features
+# ──────────────────────────────────────────────────────────────────────
+
+def robust_find_features(
+    gray_img, binary_threshold, invert_image,
+    morph_close_size, morph_dilate_size,
+    min_feature_area, max_feature_area_pct, dedup_radius,
+    use_adaptive_threshold, adaptive_block_size, adaptive_c,
+    detect_open_contours=True,
+):
+    """
+    Robustly detect ALL internal features — holes, slots, cutouts,
+    polygons, arcs, complex shapes — inside the external boundary.
+
+    Four-pass strategy:
+      Pass 1 — Contour-based: any drawn shape inside the boundary.
+      Pass 2 — Flood-fill clean: enclosed white pockets.
+      Pass 3 — Flood-fill + morph: broken/gapped contours repaired.
+      Pass 4 — Open contour: arcs, grooves, engravings.
+
+    Returns: list of InternalFeature objects.
+    """
+    binary = _binarize(gray_img, binary_threshold, invert_image,
+                       use_adaptive_threshold, adaptive_block_size, adaptive_c)
+
+    # Pass 1: contour-based
+    features1, ext_contour = _contour_based_detect(
+        binary, min_feature_area, max_feature_area_pct)
+
+    # Pass 2: flood-fill clean
+    features2 = _flood_fill_detect_features(
+        binary, min_feature_area, max_feature_area_pct)
+
+    # Pass 3: flood-fill with morph repair
+    features3 = _flood_fill_detect_features(
+        binary, min_feature_area, max_feature_area_pct,
+        morph_close_size, morph_dilate_size)
+
+    # Pass 4: open contours
+    features4 = []
+    if detect_open_contours and ext_contour is not None:
+        ext_area = cv2.contourArea(ext_contour)
+        features4 = _open_contour_detect(
+            binary, ext_contour, ext_area,
+            min_feature_area, max_feature_area_pct)
+
+    all_features = features1 + features2 + features3 + features4
+    return _deduplicate_features(all_features, dedup_radius)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Legacy wrapper: robust_find_holes (for HoleCounterNode)
+# ──────────────────────────────────────────────────────────────────────
+
+def robust_find_holes(
+    gray_img, binary_threshold, invert_image,
+    morph_close_size, morph_dilate_size,
+    min_hole_area, max_hole_area_pct, dedup_radius,
+    use_adaptive_threshold, adaptive_block_size, adaptive_c,
+):
+    features = robust_find_features(
+        gray_img=gray_img, binary_threshold=binary_threshold,
+        invert_image=invert_image,
+        morph_close_size=morph_close_size,
+        morph_dilate_size=morph_dilate_size,
+        min_feature_area=min_hole_area,
+        max_feature_area_pct=max_hole_area_pct,
+        dedup_radius=dedup_radius,
+        use_adaptive_threshold=use_adaptive_threshold,
+        adaptive_block_size=adaptive_block_size,
+        adaptive_c=adaptive_c,
+        detect_open_contours=False,
+    )
+    centers = [f.center for f in features]
+    contours = [f.contour for f in features]
+    debug = _binarize(gray_img, binary_threshold, invert_image,
+                      use_adaptive_threshold, adaptive_block_size, adaptive_c)
+    return centers, contours, debug
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Drawing
 # ──────────────────────────────────────────────────────────────────────
- 
-def draw_path(
-    image,
-    ordered_centroids,
-    line_color=(80, 80, 80),
-    start_color=(0, 180, 0),
-    end_color=(0, 0, 220),
-    point_color=(60, 60, 60),
-    line_thickness=2,
-    point_radius=6,
-):
-    """Draw the traced path on the image."""
+
+FEATURE_COLORS = {
+    "hole":      (180, 120,   0),
+    "slot":      (0,   160, 160),
+    "rectangle": (0,   140,   0),
+    "triangle":  (0,   100, 200),
+    "polygon":   (160,  80, 160),
+    "complex":   (0,    80, 200),
+    "cutout":    (100, 140,   0),
+    "arc":       (100, 100, 100),
+    "line":      (100, 100, 100),
+}
+
+
+def draw_path(image, ordered_centroids, line_color=(80,80,80),
+              start_color=(0,180,0), end_color=(0,0,220),
+              point_color=(60,60,60), line_thickness=2, point_radius=6):
     out = image.copy()
     if len(out.shape) == 2:
         out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
- 
     n = len(ordered_centroids)
     if n == 0:
         return out
- 
-    # Draw lines
     for i in range(n - 1):
         pt1 = (int(ordered_centroids[i][0]), int(ordered_centroids[i][1]))
-        pt2 = (int(ordered_centroids[i + 1][0]), int(ordered_centroids[i + 1][1]))
+        pt2 = (int(ordered_centroids[i+1][0]), int(ordered_centroids[i+1][1]))
         cv2.line(out, pt1, pt2, line_color, line_thickness, cv2.LINE_AA)
- 
-    # Draw points
     for i, (cx, cy) in enumerate(ordered_centroids):
         pt = (int(cx), int(cy))
         if i == 0:
-            cv2.circle(out, pt, point_radius + 2, start_color, -1, cv2.LINE_AA)
+            cv2.circle(out, pt, point_radius+2, start_color, -1, cv2.LINE_AA)
         elif i == n - 1:
-            cv2.circle(out, pt, point_radius + 2, end_color, -1, cv2.LINE_AA)
+            cv2.circle(out, pt, point_radius+2, end_color, -1, cv2.LINE_AA)
         else:
             cv2.circle(out, pt, point_radius, point_color, -1, cv2.LINE_AA)
- 
     return out
- 
- 
+
+
+def draw_features_path(image, ordered_features, start_point, end_point,
+                       line_color=(80,80,80), start_color=(0,180,0),
+                       end_color=(0,0,220), line_thickness=2,
+                       point_radius=6, show_contours=True,
+                       show_labels=True):
+    """Draw path with feature-type-aware color-coded annotations."""
+    out = image.copy()
+    if len(out.shape) == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+
+    all_pts = [start_point] + [f.center for f in ordered_features] + [end_point]
+    for i in range(len(all_pts) - 1):
+        p1 = (int(all_pts[i][0]), int(all_pts[i][1]))
+        p2 = (int(all_pts[i+1][0]), int(all_pts[i+1][1]))
+        cv2.line(out, p1, p2, line_color, line_thickness, cv2.LINE_AA)
+
+    cv2.circle(out, (int(start_point[0]), int(start_point[1])),
+               point_radius+2, start_color, -1, cv2.LINE_AA)
+    cv2.circle(out, (int(end_point[0]), int(end_point[1])),
+               point_radius+2, end_color, -1, cv2.LINE_AA)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for i, feat in enumerate(ordered_features):
+        color = FEATURE_COLORS.get(feat.type, (100, 100, 100))
+        pt = (int(feat.center[0]), int(feat.center[1]))
+
+        if show_contours and feat.contour is not None:
+            cv2.drawContours(out, [feat.contour], -1, color, 2, cv2.LINE_AA)
+
+        cv2.circle(out, pt, point_radius, color, -1, cv2.LINE_AA)
+        cv2.circle(out, pt, point_radius, (255, 255, 255), 1, cv2.LINE_AA)
+
+        if show_labels:
+            label = f"{i+1}:{feat.type}"
+            tsz = cv2.getTextSize(label, font, 0.38, 1)[0]
+            tx = int(feat.center[0] - tsz[0] / 2)
+            ty = int(feat.center[1] - point_radius - 6)
+            cv2.rectangle(out, (tx-2, ty-tsz[1]-2), (tx+tsz[0]+2, ty+4),
+                          (255, 255, 255), -1)
+            cv2.putText(out, label, (tx, ty), font, 0.38, color, 1, cv2.LINE_AA)
+    return out
+
+
+def draw_hole_annotations(image, hole_centers, hole_contours, point_radius=8):
+    out = image.copy()
+    if len(out.shape) == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    if not hole_centers:
+        return out
+    for cont in hole_contours:
+        if cont is not None:
+            cv2.drawContours(out, [cont], -1, (0, 180, 0), 2, cv2.LINE_AA)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for i, (cx, cy) in enumerate(hole_centers):
+        pt = (int(cx), int(cy))
+        cv2.circle(out, pt, point_radius, (0, 0, 220), -1, cv2.LINE_AA)
+        cv2.circle(out, pt, point_radius, (255, 255, 255), 1, cv2.LINE_AA)
+        label = str(i + 1)
+        tsz = cv2.getTextSize(label, font, 0.45, 1)[0]
+        tx, ty = int(cx - tsz[0]/2), int(cy - point_radius - 6)
+        cv2.rectangle(out, (tx-2, ty-tsz[1]-2), (tx+tsz[0]+2, ty+4),
+                      (255, 255, 255), -1)
+        cv2.putText(out, label, (tx, ty), font, 0.45, (0, 0, 180), 1, cv2.LINE_AA)
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────
-#  ComfyUI Node
+#  ComfyUI Node — Laser Path Tracer
 # ──────────────────────────────────────────────────────────────────────
- 
+
 class LaserPathTracerNode:
     """
-    Traces the optimal laser cutter path between internal holes in a
-    B&W diagram. Start = bottom-right, End = bottom-left.
+    Traces the optimal laser cutter path between ALL internal features
+    (holes, slots, cutouts, polygons, arcs, complex shapes).
+    Start = bottom-right, End = bottom-left.
+    Bypasses gracefully if no features are detected.
     """
- 
+
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "binary_threshold": (
-                    "INT",
-                    {"default": 128, "min": 0, "max": 255, "step": 1},
-                ),
-                "min_hole_area": (
-                    "INT",
-                    {"default": 30, "min": 1, "max": 10000, "step": 1},
-                ),
-                "max_hole_area_pct": (
-                    "FLOAT",
-                    {"default": 0.4, "min": 0.01, "max": 0.99, "step": 0.01},
-                ),
-                "line_thickness": (
-                    "INT",
-                    {"default": 2, "min": 1, "max": 10, "step": 1},
-                ),
-                "point_radius": (
-                    "INT",
-                    {"default": 6, "min": 2, "max": 20, "step": 1},
-                ),
-                "invert_image": (
-                    "BOOLEAN",
-                    {"default": False},
-                ),
-            },
-        }
- 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("traced_image", "path_info")
+        return {"required": {
+            "image": ("IMAGE",),
+            "binary_threshold": ("INT", {"default": 128, "min": 0, "max": 255, "step": 1}),
+            "min_feature_area": ("INT", {"default": 30, "min": 1, "max": 50000, "step": 1,
+                "tooltip": "Minimum contour area (px2) to count as a feature."}),
+            "max_feature_area_pct": ("FLOAT", {"default": 0.4, "min": 0.01, "max": 0.99, "step": 0.01,
+                "tooltip": "Max feature area as fraction of external boundary."}),
+            "morph_close_size": ("INT", {"default": 5, "min": 0, "max": 31, "step": 2,
+                "tooltip": "Morphological close kernel. Bridges gaps. 0=off."}),
+            "morph_dilate_size": ("INT", {"default": 0, "min": 0, "max": 15, "step": 1,
+                "tooltip": "Dilation kernel. Thickens thin strokes. 0=off."}),
+            "dedup_radius": ("INT", {"default": 15, "min": 0, "max": 100, "step": 1,
+                "tooltip": "Merge features whose centers are within this many px."}),
+            "invert_image": ("BOOLEAN", {"default": False}),
+            "use_adaptive_threshold": ("BOOLEAN", {"default": False,
+                "tooltip": "Adaptive thresholding for noisy/low-contrast images."}),
+            "adaptive_block_size": ("INT", {"default": 51, "min": 3, "max": 201, "step": 2}),
+            "adaptive_c": ("INT", {"default": 10, "min": -30, "max": 60, "step": 1}),
+            "detect_open_contours": ("BOOLEAN", {"default": True,
+                "tooltip": "Also detect arcs, grooves, engravings (open line segments)."}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("traced_image", "feature_count", "path_info")
     FUNCTION = "trace_path"
     CATEGORY = "Laser/Path"
- 
-    def trace_path(
-        self,
-        image,
-        binary_threshold,
-        min_hole_area,
-        max_hole_area_pct,
-        line_thickness,
-        point_radius,
-        invert_image,
-    ):
-        # ── 1. Convert ComfyUI image (B,H,W,C float 0-1) to OpenCV ──
-        img_np = image[0].cpu().numpy()  # (H, W, C) float 0-1
+
+    def trace_path(self, image, binary_threshold, min_feature_area,
+                   max_feature_area_pct, morph_close_size, morph_dilate_size,
+                   dedup_radius, invert_image,
+                   use_adaptive_threshold, adaptive_block_size, adaptive_c,
+                   detect_open_contours):
+
+        img_np = image[0].cpu().numpy()
         img_uint8 = (img_np * 255).clip(0, 255).astype(np.uint8)
- 
         if img_uint8.shape[2] == 4:
             img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGBA2BGR)
         else:
             img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
- 
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
- 
-        # ── 2. Binarize ──
-        _, binary = cv2.threshold(gray, binary_threshold, 255, cv2.THRESH_BINARY)
-        if invert_image:
-            binary = cv2.bitwise_not(binary)
- 
-        # For contour detection we need black shapes on white background.
-        # Contours are found on white regions in RETR_TREE with inverted image,
-        # or we detect on the inverse. Let's detect contours of the black lines:
-        binary_inv = cv2.bitwise_not(binary)
- 
-        # ── 3. Detect contours ──
-        external_contour, internal_contours = find_internal_contours(
-            binary_inv,
-            min_area=min_hole_area,
-            max_area_ratio=max_hole_area_pct,
-        )
- 
         h, w = gray.shape[:2]
- 
-        if not internal_contours:
-            # Fallback: try detecting on the non-inverted binary
-            # (holes as white regions inside a black border)
-            external_contour, internal_contours = find_internal_contours(
-                binary,
-                min_area=min_hole_area,
-                max_area_ratio=max_hole_area_pct,
-            )
- 
-        if not internal_contours:
-            info = "No internal contours (holes) detected. Try adjusting threshold or min_hole_area."
-            out_tensor = torch.from_numpy(img_np).unsqueeze(0)
-            return (out_tensor, info)
- 
-        # ── 4. Compute centroids ──
-        centroids = [contour_centroid(c) for c in internal_contours]
- 
-        # ── 5. Add virtual start (bottom-right) and end (bottom-left) ──
-        #    We snap these to the nearest hole edge if within range,
-        #    otherwise use corner coordinates offset slightly inward.
-        margin_x = int(w * 0.02)
-        margin_y = int(h * 0.02)
-        start_ref = (w - margin_x, h - margin_y)  # bottom-right
-        end_ref = (margin_x, h - margin_y)  # bottom-left
- 
-        all_points = [start_ref] + centroids + [end_ref]
-        start_idx = 0
-        end_idx = len(all_points) - 1
- 
-        # ── 6. Solve TSP ──
-        path_order = solve_tsp(all_points, start_idx, end_idx)
-        ordered_points = [all_points[i] for i in path_order]
- 
-        # ── 7. Draw ──
-        result_bgr = draw_path(
-            img_bgr,
-            ordered_points,
-            line_thickness=line_thickness,
-            point_radius=point_radius,
-        )
- 
-        # ── 8. Convert back to ComfyUI format ──
-        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-        result_float = result_rgb.astype(np.float32) / 255.0
-        out_tensor = torch.from_numpy(result_float).unsqueeze(0)
- 
-        # ── 9. Build info string ──
-        total_dist = sum(
-            euclidean(ordered_points[i], ordered_points[i + 1])
-            for i in range(len(ordered_points) - 1)
-        )
-        info_lines = [
-            f"Holes detected: {len(internal_contours)}",
-            f"Path points: {len(ordered_points)} (incl. start & end)",
+
+        # Detect all internal features
+        features = robust_find_features(
+            gray_img=gray, binary_threshold=binary_threshold,
+            invert_image=invert_image,
+            morph_close_size=morph_close_size,
+            morph_dilate_size=morph_dilate_size,
+            min_feature_area=min_feature_area,
+            max_feature_area_pct=max_feature_area_pct,
+            dedup_radius=dedup_radius,
+            use_adaptive_threshold=use_adaptive_threshold,
+            adaptive_block_size=adaptive_block_size,
+            adaptive_c=adaptive_c,
+            detect_open_contours=detect_open_contours)
+
+        feat_count = len(features)
+
+        # Bypass if nothing found
+        if feat_count == 0:
+            info = (
+                "STATUS: BYPASS -- no internal features detected.\n\n"
+                "Image returned unchanged. Troubleshooting:\n"
+                "  - Toggle invert_image\n"
+                "  - Lower min_feature_area\n"
+                "  - Enable use_adaptive_threshold\n"
+                "  - Increase morph_close_size (7-11)\n"
+                "  - Set morph_dilate_size to 2-3")
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            t = torch.from_numpy(rgb.astype(np.float32) / 255.0).unsqueeze(0)
+            return (t, 0, info)
+
+        # TSP path
+        margin_x, margin_y = int(w * 0.02), int(h * 0.02)
+        start = (w - margin_x, h - margin_y)
+        end = (margin_x, h - margin_y)
+        centers = [f.center for f in features]
+        all_pts = [start] + centers + [end]
+        order = solve_tsp(all_pts, 0, len(all_pts) - 1)
+
+        ordered_feats = [features[idx - 1] for idx in order
+                         if idx != 0 and idx != len(all_pts) - 1]
+        ordered_pts = [all_pts[i] for i in order]
+
+        # Draw path lines only — no annotations
+        result_bgr = img_bgr.copy()
+        all_centers = [start] + [f.center for f in ordered_feats] + [end]
+        for i in range(len(all_centers) - 1):
+            pt1 = (int(all_centers[i][0]), int(all_centers[i][1]))
+            pt2 = (int(all_centers[i+1][0]), int(all_centers[i+1][1]))
+            cv2.line(result_bgr, pt1, pt2, (0, 0, 0), 1, cv2.LINE_AA)
+
+        rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+        out = torch.from_numpy(rgb.astype(np.float32) / 255.0).unsqueeze(0)
+
+        # Info string
+        total_dist = sum(euclidean(ordered_pts[i], ordered_pts[i+1])
+                         for i in range(len(ordered_pts)-1))
+        tc = {}
+        for f in features:
+            tc[f.type] = tc.get(f.type, 0) + 1
+
+        lines = [
+            f"STATUS: OK -- path traced successfully.",
+            f"Features detected: {feat_count}",
+            f"Breakdown: {', '.join(f'{v}x {k}' for k, v in sorted(tc.items()))}",
+            f"Path points: {len(ordered_pts)} (incl. start & end)",
             f"Total path length: {total_dist:.1f} px",
-            f"Start: ({ordered_points[0][0]:.0f}, {ordered_points[0][1]:.0f})  [bottom-right]",
-            f"End:   ({ordered_points[-1][0]:.0f}, {ordered_points[-1][1]:.0f})  [bottom-left]",
-            "",
-            "Visit order (x, y):",
+            f"Start: ({start[0]:.0f}, {start[1]:.0f})  [bottom-right]",
+            f"End:   ({end[0]:.0f}, {end[1]:.0f})  [bottom-left]",
+            "", "Visit order:",
+            f"  0: ({start[0]:.0f}, {start[1]:.0f}) <- START",
         ]
-        for i, pt in enumerate(ordered_points):
-            label = ""
-            if i == 0:
-                label = " <- START"
-            elif i == len(ordered_points) - 1:
-                label = " <- END"
-            info_lines.append(f"  {i}: ({pt[0]:.0f}, {pt[1]:.0f}){label}")
- 
-        return (out_tensor, "\n".join(info_lines))
+        for i, feat in enumerate(ordered_feats):
+            lines.append(f"  {i+1}: {feat.info_str()}")
+        lines.append(f"  {len(ordered_feats)+1}: ({end[0]:.0f}, {end[1]:.0f}) <- END")
+
+        return (out, feat_count, "\n".join(lines))
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  ComfyUI Node — Hole Counter (backward-compatible)
+# ──────────────────────────────────────────────────────────────────────
+
+class HoleCounterNode:
+    """Robustly counts internal holes in a B&W laser-cut diagram."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "image": ("IMAGE",),
+            "binary_threshold": ("INT", {"default": 128, "min": 0, "max": 255, "step": 1}),
+            "min_hole_area": ("INT", {"default": 50, "min": 1, "max": 50000, "step": 1}),
+            "max_hole_area_pct": ("FLOAT", {"default": 0.4, "min": 0.01, "max": 0.99, "step": 0.01}),
+            "morph_close_size": ("INT", {"default": 5, "min": 0, "max": 31, "step": 2}),
+            "morph_dilate_size": ("INT", {"default": 0, "min": 0, "max": 15, "step": 1}),
+            "dedup_radius": ("INT", {"default": 15, "min": 0, "max": 100, "step": 1}),
+            "invert_image": ("BOOLEAN", {"default": False}),
+            "use_adaptive_threshold": ("BOOLEAN", {"default": False}),
+            "adaptive_block_size": ("INT", {"default": 51, "min": 3, "max": 201, "step": 2}),
+            "adaptive_c": ("INT", {"default": 10, "min": -30, "max": 60, "step": 1}),
+            "annotate_image": ("BOOLEAN", {"default": True}),
+            "show_debug_binary": ("BOOLEAN", {"default": False}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("output_image", "hole_count", "hole_info")
+    FUNCTION = "count_holes"
+    CATEGORY = "Laser/Path"
+
+    def count_holes(self, image, binary_threshold, min_hole_area,
+                    max_hole_area_pct, morph_close_size, morph_dilate_size,
+                    dedup_radius, invert_image, use_adaptive_threshold,
+                    adaptive_block_size, adaptive_c,
+                    annotate_image, show_debug_binary):
+
+        img_np = image[0].cpu().numpy()
+        img_uint8 = (img_np * 255).clip(0, 255).astype(np.uint8)
+        if img_uint8.shape[2] == 4:
+            img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGBA2BGR)
+        else:
+            img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        centers, contours, debug = robust_find_holes(
+            gray, binary_threshold, invert_image,
+            morph_close_size, morph_dilate_size,
+            min_hole_area, max_hole_area_pct, dedup_radius,
+            use_adaptive_threshold, adaptive_block_size, adaptive_c)
+
+        count = len(centers)
+        if show_debug_binary:
+            vis = cv2.cvtColor(debug, cv2.COLOR_GRAY2BGR)
+        elif annotate_image:
+            vis = draw_hole_annotations(img_bgr, centers, contours)
+        else:
+            vis = img_bgr.copy()
+
+        rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        out = torch.from_numpy(rgb.astype(np.float32) / 255.0).unsqueeze(0)
+
+        indexed = sorted(enumerate(centers), key=lambda x: (x[1][1], x[1][0]))
+        lines = [f"Holes detected: {count}", ""]
+        for rank, (_, (cx, cy)) in enumerate(indexed):
+            lines.append(f"  #{rank+1}: ({cx:.0f}, {cy:.0f})")
+        return (out, count, "\n".join(lines))
