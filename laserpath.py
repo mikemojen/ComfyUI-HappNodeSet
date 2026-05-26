@@ -214,6 +214,63 @@ def _find_external_boundary(contours, areas):
     return ext_idx, contours[ext_idx], areas[ext_idx]
 
 
+def _find_all_pieces(contours, areas, hierarchy, img_area,
+                     min_piece_pct=0.002):
+    """
+    Identify all separate pieces (external boundaries) in the image.
+
+    A piece is a contour that:
+      - Has area > min_piece_pct of the total image area
+      - Is NOT fully contained inside another larger piece
+        (i.e. it's not a hole/feature of a bigger piece)
+
+    Returns list of (contour_index, contour, area) tuples.
+    """
+    if not contours:
+        return []
+
+    min_piece_area = img_area * min_piece_pct
+    h = hierarchy[0] if hierarchy is not None else None
+
+    # Gather candidate pieces sorted by area descending
+    candidates = []
+    for i, c in enumerate(contours):
+        a = areas[i]
+        if a >= min_piece_area:
+            candidates.append((i, c, a))
+    candidates.sort(key=lambda x: -x[2])
+
+    if not candidates:
+        return []
+
+    # Filter: reject contours whose centroid is inside a larger contour
+    # AND whose area is less than half of that larger contour (= a feature).
+    # Keep contours that are independent pieces or nearly as large as
+    # their parent (= outer/inner stroke edge of the same piece).
+    pieces = []
+    piece_contours = []  # contours already accepted as pieces
+
+    for idx, c, a in candidates:
+        cx, cy = contour_centroid(c)
+        is_sub_feature = False
+
+        for p_idx, p_c, p_a in piece_contours:
+            if a > p_a * 0.85:
+                # Nearly same size as parent — likely inner/outer stroke
+                # edge of the same piece. Skip (dedup will handle).
+                continue
+            inside = cv2.pointPolygonTest(p_c, (cx, cy), False)
+            if inside >= 0 and a < p_a * 0.5:
+                is_sub_feature = True
+                break
+
+        if not is_sub_feature:
+            pieces.append((idx, c, a))
+            piece_contours.append((idx, c, a))
+
+    return pieces
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Legacy: simple contour detection (used by HoleCounter pass 3)
 # ──────────────────────────────────────────────────────────────────────
@@ -256,60 +313,68 @@ def find_internal_contours(binary_img, min_area=30, max_area_ratio=0.5):
 
 def _contour_based_detect(binary, min_area, max_area_ratio):
     """
-    Hierarchy-aware contour detection that finds ALL internal features:
-    holes, slots, rectangles, stars, polygons, etc.
+    Hierarchy-aware contour detection that finds ALL internal features
+    across ALL pieces in the image.
     """
     lines_mask = cv2.bitwise_not(binary)
     contours, hierarchy = cv2.findContours(
         lines_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if not contours or hierarchy is None:
-        return [], None
+        return [], []
 
     areas = [cv2.contourArea(c) for c in contours]
-    ext_idx, ext_contour, ext_area = _find_external_boundary(contours, areas)
-    if ext_contour is None:
-        return [], None
+    h, w = binary.shape[:2]
+    img_area = h * w
+
+    # Find all pieces (external boundaries)
+    pieces = _find_all_pieces(contours, areas, hierarchy, img_area)
+    if not pieces:
+        return [], []
+
+    piece_indices = set(idx for idx, _, _ in pieces)
 
     features = []
     for i, c in enumerate(contours):
-        if i == ext_idx:
+        if i in piece_indices:
             continue
         a = areas[i]
-        if a < min_area or a > ext_area * max_area_ratio:
-            continue
-        cx, cy = contour_centroid(c)
-        if cv2.pointPolygonTest(ext_contour, (cx, cy), False) < 0:
+        if a < min_area:
             continue
 
-        # Reject boundary artifacts: if most contour points are very
-        # close to the external boundary AND the shape is not a
-        # recognizable feature (hole, slot, etc.), reject it.
-        # Key insight: legitimate edge-mounted holes have high
-        # circularity. Boundary artifacts (corner fragments,
-        # double-stroke edges) have low circularity and high
-        # aspect ratio.
+        cx, cy = contour_centroid(c)
+
+        # Check if this contour is inside ANY piece
+        parent_piece = None
+        for p_idx, p_c, p_a in pieces:
+            if a > p_a * max_area_ratio:
+                continue
+            if cv2.pointPolygonTest(p_c, (cx, cy), False) >= 0:
+                parent_piece = (p_idx, p_c, p_a)
+                break
+
+        if parent_piece is None:
+            continue
+
+        p_idx, p_c, p_a = parent_piece
+
+        # Boundary-proximity filter (shape-aware)
         cls = classify_contour(c)
 
         pts = c.reshape(-1, 2).astype(np.float64)
         if len(pts) > 0:
-            dists = [abs(cv2.pointPolygonTest(ext_contour, (float(p[0]), float(p[1])), True))
+            dists = [abs(cv2.pointPolygonTest(p_c, (float(p[0]), float(p[1])), True))
                      for p in pts[::max(1, len(pts)//20)]]
             median_dist = float(np.median(dists))
             if median_dist < 15:
-                # Near boundary — only keep if it looks like a real feature
-                circ = cls["circularity"]
-                solid = cls["solidity"]
-                ar = cls["aspect_ratio"]
-                # Reject: low circularity OR elongated = boundary artifact
-                # Keep: high circularity (>0.65) = legitimate hole/feature
-                if circ < 0.65:
+                if cls["circularity"] < 0.65:
                     continue
-                if solid > 0.95 and a > ext_area * 0.01:
-                    continue  # large solid region hugging boundary
+                if cls["solidity"] > 0.95 and a > p_a * 0.01:
+                    continue
 
         features.append(InternalFeature((cx, cy), c, cls))
 
-    return features, ext_contour
+    piece_contours = [p_c for _, p_c, _ in pieces]
+    return features, piece_contours
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -319,6 +384,7 @@ def _contour_based_detect(binary, min_area, max_area_ratio):
 def _flood_fill_detect_features(binary, min_area, max_area_ratio,
                                 morph_close_size=0, morph_dilate_size=0):
     h, w = binary.shape[:2]
+    img_area = h * w
     lines_mask = cv2.bitwise_not(binary)
 
     if morph_close_size > 0:
@@ -331,13 +397,14 @@ def _flood_fill_detect_features(binary, min_area, max_area_ratio,
         lines_mask = cv2.dilate(lines_mask, k, iterations=1)
 
     repaired = cv2.bitwise_not(lines_mask)
-    contours_all, _ = cv2.findContours(
+    contours_all, hierarchy_all = cv2.findContours(
         lines_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if not contours_all:
         return []
     areas_all = [cv2.contourArea(c) for c in contours_all]
-    _, ext_contour, ext_area = _find_external_boundary(contours_all, areas_all)
-    if ext_contour is None:
+
+    pieces = _find_all_pieces(contours_all, areas_all, hierarchy_all, img_area)
+    if not pieces:
         return []
 
     flood = repaired.copy()
@@ -347,18 +414,26 @@ def _flood_fill_detect_features(binary, min_area, max_area_ratio,
     num_labels, labels, stats, centroids_cc = cv2.connectedComponentsWithStats(
         flood, connectivity=8)
 
-    max_feat_area = ext_area * max_area_ratio
     features = []
     for lid in range(1, num_labels):
         area = stats[lid, cv2.CC_STAT_AREA]
-        if area < min_area or area > max_feat_area:
+        if area < min_area:
             continue
         cx, cy = float(centroids_cc[lid][0]), float(centroids_cc[lid][1])
-        if cv2.pointPolygonTest(ext_contour, (cx, cy), False) < 0:
+
+        # Find parent piece
+        parent_piece = None
+        for p_idx, p_c, p_a in pieces:
+            if area > p_a * max_area_ratio:
+                continue
+            if cv2.pointPolygonTest(p_c, (cx, cy), False) >= 0:
+                parent_piece = (p_idx, p_c, p_a)
+                break
+        if parent_piece is None:
             continue
-        # Boundary proximity check — shape-aware
-        dist_to_boundary = abs(cv2.pointPolygonTest(
-            ext_contour, (cx, cy), True))
+
+        p_idx, p_c, p_a = parent_piece
+        dist_to_boundary = abs(cv2.pointPolygonTest(p_c, (cx, cy), True))
         cmask = (labels == lid).astype(np.uint8) * 255
         cc, _ = cv2.findContours(cmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cont = cc[0] if cc else None
@@ -368,11 +443,9 @@ def _flood_fill_detect_features(binary, min_area, max_area_ratio,
             area=area, perimeter=0)
 
         if dist_to_boundary < 20:
-            circ = cls["circularity"]
-            # Keep circular features near boundary, reject artifacts
-            if circ < 0.65:
+            if cls["circularity"] < 0.65:
                 continue
-            if cls["solidity"] > 0.95 and area > ext_area * 0.01:
+            if cls["solidity"] > 0.95 and area > p_a * 0.01:
                 continue
 
         features.append(InternalFeature((cx, cy), cont, cls))
@@ -383,12 +456,9 @@ def _flood_fill_detect_features(binary, min_area, max_area_ratio,
 #  Pass 4: Open contour detection (arcs, grooves, engravings)
 # ──────────────────────────────────────────────────────────────────────
 
-def _open_contour_detect(binary, ext_contour, ext_area,
-                         min_area, max_area_ratio):
+def _open_contour_detect(binary, piece_contours, min_area, max_area_ratio):
     """
-    Detect open contours — arcs, grooves, engravings — that are line
-    segments inside the boundary but don't form closed regions.
-    Uses connected-component analysis on the black line pixels.
+    Detect open contours (arcs, grooves) inside any piece.
     """
     lines_mask = cv2.bitwise_not(binary)
     num_labels, labels, stats, centroids_cc = cv2.connectedComponentsWithStats(
@@ -397,39 +467,43 @@ def _open_contour_detect(binary, ext_contour, ext_area,
     if num_labels < 2:
         return []
 
-    # The largest line-pixel component is always the external boundary
-    # itself (or boundary + connected inner lines). Skip it.
+    # Skip the largest line-pixel component (external boundary)
     all_areas = [stats[lid, cv2.CC_STAT_AREA] for lid in range(1, num_labels)]
-    max_line_comp_label = int(np.argmax(all_areas)) + 1  # +1 to skip bg
+    max_line_comp_label = int(np.argmax(all_areas)) + 1
 
-    max_feat_area = ext_area * max_area_ratio
     features = []
     for lid in range(1, num_labels):
         if lid == max_line_comp_label:
-            continue  # skip external boundary
+            continue
         area = stats[lid, cv2.CC_STAT_AREA]
-        if area < min_area or area > max_feat_area:
+        if area < min_area:
             continue
         cx, cy = float(centroids_cc[lid][0]), float(centroids_cc[lid][1])
-        if ext_contour is not None:
-            if cv2.pointPolygonTest(ext_contour, (cx, cy), False) < 0:
+
+        # Find parent piece
+        parent_piece = None
+        for p_c in piece_contours:
+            p_a = cv2.contourArea(p_c)
+            if area > p_a * max_area_ratio:
                 continue
-            # Boundary proximity — shape-aware
-            dist_to_boundary = abs(cv2.pointPolygonTest(
-                ext_contour, (cx, cy), True))
-            if dist_to_boundary < 20:
-                # Classify first to decide
-                cmask_pre = (labels == lid).astype(np.uint8) * 255
-                cc_pre, _ = cv2.findContours(cmask_pre, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cont_pre = cc_pre[0] if cc_pre else None
-                if cont_pre is not None:
-                    cls_pre = classify_contour(cont_pre)
-                    if cls_pre["circularity"] < 0.65:
-                        continue
-                    if cls_pre["solidity"] > 0.95 and area > ext_area * 0.01:
-                        continue
-                else:
+            if cv2.pointPolygonTest(p_c, (cx, cy), False) >= 0:
+                parent_piece = p_c
+                break
+        if parent_piece is None:
+            continue
+
+        dist_to_boundary = abs(cv2.pointPolygonTest(parent_piece, (cx, cy), True))
+        if dist_to_boundary < 20:
+            cmask_pre = (labels == lid).astype(np.uint8) * 255
+            cc_pre, _ = cv2.findContours(cmask_pre, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cont_pre = cc_pre[0] if cc_pre else None
+            if cont_pre is not None:
+                cls_pre = classify_contour(cont_pre)
+                if cls_pre["circularity"] < 0.65:
                     continue
+            else:
+                continue
+
         cmask = (labels == lid).astype(np.uint8) * 255
         cc, _ = cv2.findContours(cmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cont = cc[0] if cc else None
@@ -492,7 +566,7 @@ def robust_find_features(
                        use_adaptive_threshold, adaptive_block_size, adaptive_c)
 
     # Pass 1: contour-based
-    features1, ext_contour = _contour_based_detect(
+    features1, piece_contours = _contour_based_detect(
         binary, min_feature_area, max_feature_area_pct)
 
     # Pass 2: flood-fill clean
@@ -506,10 +580,9 @@ def robust_find_features(
 
     # Pass 4: open contours
     features4 = []
-    if detect_open_contours and ext_contour is not None:
-        ext_area = cv2.contourArea(ext_contour)
+    if detect_open_contours and piece_contours:
         features4 = _open_contour_detect(
-            binary, ext_contour, ext_area,
+            binary, piece_contours,
             min_feature_area, max_feature_area_pct)
 
     all_features = features1 + features2 + features3 + features4
@@ -853,3 +926,6 @@ class HoleCounterNode:
         for rank, (_, (cx, cy)) in enumerate(indexed):
             lines.append(f"  #{rank+1}: ({cx:.0f}, {cy:.0f})")
         return (out, count, "\n".join(lines))
+
+
+# ──────────────────────────────────────────────────────────────────────
