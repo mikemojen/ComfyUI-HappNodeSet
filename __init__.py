@@ -36,7 +36,6 @@ NODE_CLASS_MAPPINGS = {
     "HoleCounter": HoleCounterNode,
     "ContourGapCloser": ContourGapCloser,
     "ContourEndpointVisualizer": ContourEndpointVisualizer,
-    "DiagramCleaner": DiagramCleaner,
     "LineLengthCalculator": LineLengthCalculator,   
 }
 
@@ -61,6 +60,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HoleCounter": "Hole Counter (Robust)",
     "ContourGapCloser": "Contour Gap Closer",
     "ContourEndpointVisualizer": "Contour Endpoint Visualizer",
-    "DiagramCleaner": "Diagram Cleaner",
     "LineLengthCalculator": "Line Length Calculator",
 }
