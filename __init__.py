@@ -13,6 +13,7 @@ from .linecounter import *
 from .numstrcleanup import *
 from .laserpath import *
 from .contourgapcloser import *
+from .line_length_node import *
 
 NODE_CLASS_MAPPINGS = {
     "RasterToUniformSVG": RasterToSVGConverter,
@@ -35,6 +36,8 @@ NODE_CLASS_MAPPINGS = {
     "HoleCounter": HoleCounterNode,
     "ContourGapCloser": ContourGapCloser,
     "ContourEndpointVisualizer": ContourEndpointVisualizer,
+    "DiagramCleaner": DiagramCleaner,
+    "LineLengthCalculator": LineLengthCalculator,   
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -58,4 +61,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HoleCounter": "Hole Counter (Robust)",
     "ContourGapCloser": "Contour Gap Closer",
     "ContourEndpointVisualizer": "Contour Endpoint Visualizer",
+    "DiagramCleaner": "Diagram Cleaner",
+    "LineLengthCalculator": "Line Length Calculator",
 }
